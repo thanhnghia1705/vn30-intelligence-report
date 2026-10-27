@@ -1,6 +1,7 @@
 import os
 import sys
 import json
+import time
 import re
 import smtplib
 import urllib.request
@@ -35,9 +36,9 @@ HEADERS = {
 }
 
 # ==============================================================================
-# HÀM THU THẬP DỮ LIỆU THỊ TRƯỜNG & CHỨNG CHỈ QUỸ VN30 (VNDIRECT & CAFEF API)
+# HÀM THU THẬP DỮ LIỆU THỊ TRƯỜNG & CHỨNG CHỈ QUỸ VN30 (ENTRADE DNSE & VNDIRECT)
 # ==============================================================================
-def fetch_url(url, timeout=12):
+def fetch_url(url, timeout=10):
     """Gửi request lấy dữ liệu với timeout và header chuẩn trình duyệt."""
     try:
         req = urllib.request.Request(url, headers=HEADERS)
@@ -47,23 +48,29 @@ def fetch_url(url, timeout=12):
         print(f"[Cảnh báo] Lỗi khi truy cập {url}: {e}")
         return None
 
-def fetch_vndirect_prices(symbol="E1VFVN30", size=45):
-    """Lấy dữ liệu giá chuẩn từ Cổng dữ liệu Finfo của VNDirect."""
-    url = f"https://finfo-api.vndirect.com.vn/v4/stock_prices?sort=date:desc&q=code:{symbol}&size={size}"
+def fetch_entrade_bars(symbol="E1VFVN30", is_index=False, days=60):
+    """Lấy dữ liệu nến trực tiếp từ Open API của Entrade DNSE (không chặn IP quốc tế)."""
+    now_ts = int(time.time())
+    from_ts = now_ts - (days * 86400)
+    endpoint = "index" if is_index else "stock"
+    url = f"https://services.entrade.com.vn/chart-api/v2/ohlcs/{endpoint}?from={from_ts}&to={now_ts}&symbol={symbol}&resolution=1D"
     data_str = fetch_url(url)
     if not data_str:
-        return []
+        return None
     try:
         res = json.loads(data_str)
-        return res.get("data", [])
+        closes = res.get("c", [])
+        if closes:
+            return res
+        return None
     except Exception as e:
-        print(f"[Cảnh báo] Lỗi parse JSON từ VNDirect ({symbol}): {e}")
-        return []
+        print(f"[Cảnh báo] Lỗi parse Entrade API ({symbol}): {e}")
+        return None
 
 def calculate_rsi(prices, period=14):
     """Tính chỉ số sức mạnh tương đối RSI-14."""
     if len(prices) < period + 1:
-        return 50.0
+        return 52.0
     deltas = [prices[i] - prices[i - 1] for i in range(1, len(prices))]
     recent_deltas = deltas[-period:]
     gains = [d for d in recent_deltas if d > 0]
@@ -75,99 +82,82 @@ def calculate_rsi(prices, period=14):
     return round(rsi, 1)
 
 def get_market_intelligence():
-    """Thu thập toàn bộ dữ liệu định lượng của E1VFVN30 và VN30-Index từ VNDirect."""
+    """Thu thập toàn bộ dữ liệu định lượng của E1VFVN30 và VN30-Index."""
     intel = {
         "ticker": "E1VFVN30",
         "fund_name": "Quỹ ETF DCVFMVN30 (Mô phỏng rổ VN30)",
-        "current_price": 25150,
-        "prev_price": 24950,
+        "current_price": 34000,
+        "prev_price": 33800,
         "change_price": 200,
-        "change_pct": 0.80,
-        "high": 25250,
-        "low": 24900,
-        "volume": 1420000,
-        "ma20": 24700,
-        "ma50": 24100,
+        "change_pct": 0.59,
+        "high": 34200,
+        "low": 33750,
+        "volume": 250000,
+        "ma20": 33500,
+        "ma50": 32800,
         "rsi": 56.4,
-        "vn30_index": 1335.8,
-        "vn30_change_pct": 0.62,
+        "vn30_index": 1888.4,
+        "vn30_change_pct": 0.48,
         "date_str": NOW_VN.strftime("%d/%m/%Y"),
         "is_live_data": False
     }
 
-    # 1. Gọi trực tiếp từ Cổng dữ liệu VNDirect cho E1VFVN30
-    e1_records = fetch_vndirect_prices(symbol="E1VFVN30", size=45)
-    if e1_records and len(e1_records) >= 2:
+    # 1. Thu thập dữ liệu E1VFVN30 qua Entrade DNSE
+    etf_res = fetch_entrade_bars(symbol="E1VFVN30", is_index=False, days=90)
+    if etf_res and len(etf_res.get("c", [])) >= 2:
         try:
-            latest = e1_records[0]
-            prev = e1_records[1]
-            
-            raw_close = float(latest.get("close", 0))
-            raw_prev = float(prev.get("close", raw_close))
-            
-            # Chuẩn hóa giá: VNDirect thường trả giá chia 1,000 (vd: 25.15)
-            c_price = int(raw_close * 1000) if raw_close < 1000 else int(raw_close)
-            p_price = int(raw_prev * 1000) if raw_prev < 1000 else int(raw_prev)
-            
+            raw_closes = etf_res.get("c", [])
+            raw_highs = etf_res.get("h", raw_closes)
+            raw_lows = etf_res.get("l", raw_closes)
+            raw_vols = etf_res.get("v", [0])
+
+            # Entrade trả giá đơn vị nghìn đồng (vd: 34 = 34,000đ)
+            factor = 1000 if raw_closes[-1] < 1000 else 1
+            prices = [int(p * factor) for p in raw_closes]
+
+            c_price = prices[-1]
+            p_price = prices[-2]
             diff = c_price - p_price
-            pct = latest.get("pctChange")
-            if pct is None:
-                pct = round((diff / p_price) * 100, 2) if p_price else 0.0
-            else:
-                pct = round(float(pct), 2)
-                
-            raw_high = float(latest.get("high", raw_close))
-            raw_low = float(latest.get("low", raw_close))
-            
+            pct = round((diff / p_price) * 100, 2) if p_price else 0.0
+
             intel["current_price"] = c_price
             intel["prev_price"] = p_price
             intel["change_price"] = diff
             intel["change_pct"] = pct
-            intel["high"] = int(raw_high * 1000) if raw_high < 1000 else int(raw_high)
-            intel["low"] = int(raw_low * 1000) if raw_low < 1000 else int(raw_low)
-            intel["volume"] = int(latest.get("nmVolume", 0) or latest.get("totalVolume", 0))
-            
-            # Tính MA20, MA50, RSI từ chuỗi giá lịch sử
-            history_prices = []
-            for item in reversed(e1_records):
-                p = float(item.get("close", 0))
-                p = p * 1000 if p < 1000 else p
-                if p > 0:
-                    history_prices.append(p)
-                    
-            if len(history_prices) >= 20:
-                intel["ma20"] = int(sum(history_prices[-20:]) / 20)
-            if len(history_prices) >= 40:
-                intel["ma50"] = int(sum(history_prices[-40:]) / len(history_prices[-40:]))
-                
-            intel["rsi"] = calculate_rsi(history_prices, period=14)
-            intel["is_live_data"] = True
-            print("[Thành công] Đã lấy dữ liệu thời gian thực E1VFVN30 từ VNDirect API.")
-        except Exception as e:
-            print(f"[Cảnh báo] Lỗi tính toán dữ liệu VNDirect E1VFVN30: {e}")
+            intel["high"] = int(raw_highs[-1] * factor)
+            intel["low"] = int(raw_lows[-1] * factor)
+            intel["volume"] = int(raw_vols[-1]) if raw_vols else 0
 
-    # 2. Gọi chỉ số VN30 từ VNDirect
-    vn30_records = fetch_vndirect_prices(symbol="VN30", size=5)
-    if vn30_records and len(vn30_records) >= 2:
+            if len(prices) >= 20:
+                intel["ma20"] = int(sum(prices[-20:]) / 20)
+            if len(prices) >= 50:
+                intel["ma50"] = int(sum(prices[-50:]) / 50)
+
+            intel["rsi"] = calculate_rsi(prices, period=14)
+            intel["is_live_data"] = True
+            print(f"[Thành công] Lấy dữ liệu Realtime E1VFVN30: {c_price:,} đ ({diff:+,} đ, {pct}%).")
+        except Exception as e:
+            print(f"[Cảnh báo] Lỗi tính toán dữ liệu Entrade E1VFVN30: {e}")
+
+    # 2. Thu thập chỉ số VN30 Index
+    vn30_res = fetch_entrade_bars(symbol="VN30", is_index=True, days=15)
+    if vn30_res and len(vn30_res.get("c", [])) >= 2:
         try:
-            v_latest = vn30_records[0]
-            v_prev = vn30_records[1]
-            v_curr = float(v_latest.get("close", 0))
-            v_pct = v_latest.get("pctChange")
-            if v_pct is None:
-                vp = float(v_prev.get("close", v_curr))
-                v_pct = round(((v_curr - vp) / vp) * 100, 2) if vp else 0.0
-            else:
-                v_pct = round(float(v_pct), 2)
+            v_closes = vn30_res.get("c", [])
+            v_curr = float(v_closes[-1])
+            v_prev = float(v_closes[-2])
+            v_diff = v_curr - v_prev
+            v_pct = round((v_diff / v_prev) * 100, 2) if v_prev else 0.0
+
             intel["vn30_index"] = round(v_curr, 2)
             intel["vn30_change_pct"] = v_pct
-            print(f"[Thành công] Đã lấy dữ liệu VN30 Index: {v_curr} điểm ({v_pct}%).")
+            print(f"[Thành công] Lấy dữ liệu VN30 Index: {v_curr} điểm ({v_pct}%).")
         except Exception as e:
-            print(f"[Cảnh báo] Lỗi parse VN30 index từ VNDirect: {e}")
+            print(f"[Cảnh báo] Lỗi parse VN30 index: {e}")
 
-    # 3. Phân loại ma trận nhận định theo ngôn ngữ bình dân
+    # 3. Phân loại tín hiệu mua/bán theo ngôn ngữ bình dân
     rsi = intel["rsi"]
-    
+
     if rsi < 35:
         intel["signal_verdict"] = "MUA GOM MẠNH (VÙNG GIÁ RẺ)"
         intel["signal_badge"] = "MUA GOM MẠNH"
@@ -221,24 +211,24 @@ def fetch_rss_news():
         {"name": "VnExpress Kinh Doanh", "url": "https://vnexpress.net/rss/kinh-doanh.rss"}
     ]
     keywords = ["vn30", "chứng khoán", "vn-index", "cổ phiếu", "khối ngoại", "lãi suất", "ngân hàng", "quỹ", "etf", "thị trường"]
-    
+
     for f in feeds:
         try:
             req = urllib.request.Request(f["url"], headers=HEADERS)
             with urllib.request.urlopen(req, timeout=8) as resp:
                 xml_data = resp.read()
                 root = ET.fromstring(xml_data)
-                
+
                 for item in root.findall(".//item")[:10]:
                     title = item.find("title").text if item.find("title") is not None else ""
                     link = item.find("link").text if item.find("link") is not None else ""
                     desc = item.find("description").text if item.find("description") is not None else ""
                     pub_date = item.find("pubDate").text if item.find("pubDate") is not None else ""
-                    
+
                     cleaned_title = clean_html(title)
                     cleaned_desc = clean_html(desc)
                     text_to_check = f"{cleaned_title} {cleaned_desc}".lower()
-                    
+
                     if any(k in text_to_check for k in keywords):
                         short_desc = cleaned_desc[:140] + "..." if len(cleaned_desc) > 140 else cleaned_desc
                         news_items.append({
@@ -252,7 +242,7 @@ def fetch_rss_news():
                             break
         except Exception as e:
             print(f"[Cảnh báo] Lỗi đọc RSS từ {f['name']}: {e}")
-            
+
     if not news_items:
         news_items = [
             {
@@ -284,14 +274,14 @@ def generate_html_email(data, news_list):
     price_color = "#10b981" if data["change_price"] > 0 else ("#ef4444" if data["change_price"] < 0 else "#f59e0b")
     price_sign = "+" if data["change_price"] > 0 else ""
     change_text = f"{price_sign}{data['change_price']:,} đ ({price_sign}{data['change_pct']}%)".replace(",", ".")
-    
+
     curr_price_str = f"{data['current_price']:,} đ".replace(",", ".")
     ma20_str = f"{data['ma20']:,} đ".replace(",", ".")
     ma50_str = f"{data['ma50']:,} đ".replace(",", ".")
-    
+
     ma20_diff = data["current_price"] - data["ma20"]
     ma20_status = "Đang cao hơn hỗ trợ MA20 (Xu thế Tăng lành mạnh)" if ma20_diff >= 0 else "Đang dưới cản MA20 (Vùng chiết khấu Rẻ)"
-    
+
     if data["rsi"] < 40:
         rsi_status = "VÙNG QUÁ BÁN (Giá rẻ, cơ hội gom)"
         rsi_color = "#10b981"
@@ -330,7 +320,7 @@ def generate_html_email(data, news_list):
         <tr>
             <td align="center">
                 <table role="presentation" width="100%" border="0" cellspacing="0" cellpadding="0" style="max-width: 620px; background-color: #ffffff; border-radius: 16px; overflow: hidden; box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.08), 0 8px 10px -6px rgba(0, 0, 0, 0.04);">
-                    
+
                     <!-- 1. HEADER SANG TRỌNG VỚI TONE MÀU NAVY -->
                     <tr>
                         <td style="background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%); padding: 25px 20px; text-align: center; border-bottom: 3px solid #38bdf8;">
@@ -484,7 +474,7 @@ def generate_html_email(data, news_list):
                                     <span style="background-color: #0f172a; color: #ffffff; border-radius: 50%; width: 22px; height: 22px; display: inline-block; text-align: center; line-height: 22px; font-size: 12px; margin-right: 8px;">4</span>
                                     TẦNG 4: QUY TẮC MUA VÔ & BÁN RA (DÀNH CHO BẠN)
                                 </div>
-                                
+
                                 <!-- Khung Khi Nào Cần Mua Vô -->
                                 <div style="background-color: #f0fdf4; border: 1px solid #bbf7d0; border-radius: 10px; padding: 14px; margin-bottom: 12px;">
                                     <div style="font-weight: 800; color: #166534; font-size: 14px; margin-bottom: 6px;">
@@ -580,18 +570,18 @@ def send_email(subject, html_content, recipients):
         server.ehlo()
         server.starttls()
         server.ehlo()
-        
+
         print(f"[Đang đăng nhập] Xác thực tài khoản: {EMAIL_USER}...")
         server.login(EMAIL_USER, EMAIL_PASS)
-        
+
         msg = MIMEMultipart("alternative")
         msg["Subject"] = subject
         msg["From"] = f"VN30 Intelligence Bot <{EMAIL_USER}>"
         msg["To"] = ", ".join(recipients)
-        
+
         part = MIMEText(html_content, "html", "utf-8")
         msg.attach(part)
-        
+
         print(f"[Đang gửi email] Gửi tới danh sách: {recipients}...")
         server.sendmail(EMAIL_USER, recipients, msg.as_string())
         server.quit()
@@ -612,34 +602,34 @@ def main():
     print("=" * 65)
     print(f"BẮT ĐẦU CHƯƠNG TRÌNH PHÂN TÍCH & BÁO CÁO VN30 ({NOW_VN.strftime('%Y-%m-%d %H:%M:%S')} VN)")
     print("=" * 65)
-    
+
     # 1. Thu thập dữ liệu định lượng
-    print("-> Bước 1: Thu thập số liệu kỹ thuật mã E1VFVN30 và VN30-Index từ VNDirect API...")
+    print("-> Bước 1: Thu thập số liệu kỹ thuật mã E1VFVN30 và VN30-Index...")
     data = get_market_intelligence()
-    
+
     # 2. Thu thập điểm tin báo chí
     print("-> Bước 2: Chắt lọc tin tức từ CafeF và VnExpress qua bộ lọc Anti-Noise...")
     news_list = fetch_rss_news()
     print(f"   Đã chọn lọc được {len(news_list)} tin bài vĩ mô tiêu biểu.")
-    
+
     # 3. Tạo mẫu email Mobile-first HTML
     print("-> Bước 3: Tạo giao diện Email HTML theo mô hình phễu 4 tầng...")
     html_content = generate_html_email(data, news_list)
-    
+
     # Tiêu đề email sinh động
     price_str = f"{data['current_price']:,}đ".replace(",", ".")
     subject = f"📊 [VN30 10H SÁNG] {data['signal_badge']} | Giá: {price_str} ({data['change_pct']}%) | Lời khuyên cho bạn hôm nay"
-    
+
     # 4. Gửi email tới người nhận
     print(f"-> Bước 4: Khởi chạy gửi email tới {RECIPIENTS}...")
     success = send_email(subject, html_content, RECIPIENTS)
-    
+
     if not success:
         demo_file = "preview_email.html"
         with open(demo_file, "w", encoding="utf-8") as f:
             f.write(html_content)
         print(f"[Thông báo] Đã lưu bản xem trước giao diện email tại: {demo_file}")
-        
+
     print("=" * 65)
     print("HOÀN TẤT CHU TRÌNH TỰ ĐỘNG HÓA.")
     print("=" * 65)
